@@ -10,6 +10,8 @@ from .nodes.conditioning import (
 )
 from .nodes.director import MiniMaxH3Director
 from .nodes.director_refine import MiniMaxH3DirectorRefine
+from .nodes.script_loader import H3ScriptLoader
+from .nodes.script_exporter import H3ScriptExporter
 from .nodes.director_groups import (
     MiniMaxH3DirectorGroupImageToVideo,
     MiniMaxH3DirectorGroupReferenceToVideo,
@@ -19,6 +21,8 @@ from .nodes.director_groups import (
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3Director": MiniMaxH3Director,
     "MiniMaxH3DirectorRefine": MiniMaxH3DirectorRefine,
+    "H3ScriptLoader": H3ScriptLoader,
+    "H3ScriptExporter": H3ScriptExporter,
     # Legacy type id kept so older workflows still load.
     "ComfyMiniMaxH3Director": MiniMaxH3Director,
     "MiniMaxH3DirectorConditioning": MiniMaxH3DirectorConditioning,
@@ -39,6 +43,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3DirectorGroupImageToVideo": "MiniMax H3 Director Group (Image to Video)",
     "MiniMaxH3DirectorGroupReferenceToVideo": "MiniMax H3 Director Group (Reference to Video)",
     "MiniMaxH3DirectorGroupsCombine": "MiniMax H3 Director Groups Combine",
+    "H3ScriptLoader": "H3 Director Script Loader",
+    "H3ScriptExporter": "H3 Director Script Exporter",
 }
 
 WEB_DIRECTORY = "./web/js"

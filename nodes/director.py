@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
+import torch
+
 import comfy.samplers
 
 from ..director.executor_core import execute_director_plan_core
@@ -103,6 +107,17 @@ class MiniMaxH3Director:
                         ),
                     },
                 ),
+                "script_timeline": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "可选：外部剧本 .json 经 H3 Director Script Loader 生成的 timeline_data 字符串。"
+                            "连接后覆盖本节点的 timeline_data / global_prompt / total_frames widget，"
+                            "实现『提示词配置单』外置、免 build 换剧本。"
+                        ),
+                    },
+                ),
                 "bd_grp_advanced": ("BDGROUP", {"default": "高级采样"}),
                 "steps": (
                     "INT",
@@ -165,9 +180,11 @@ class MiniMaxH3Director:
 
         return first_pass_cache_disk_signature(unique_id)
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "STRING", "IMAGE")
-    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "source_images", "report", "images_pre_refine")
-    OUTPUT_IS_LIST = (True, True, False, False, True, False, True)
+    # 追加输出（槽位 7~10）：global_prompt 与去重后的参考图。
+    # 只在末尾追加，旧工作流对槽位 0~6 的连线不受影响。
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "STRING", "IMAGE", "STRING", "IMAGE", "IMAGE", "IMAGE", "STRING", "IMAGE", "IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "source_images", "report", "images_pre_refine", "global_prompt", "ref_image_0", "ref_image_1", "ref_image_2", "timeline_data", "all_ref_images", "segment_images", "segment_audios")
+    OUTPUT_IS_LIST = (True, True, False, False, True, False, True, False, False, False, False, False, False, True, True)
     FUNCTION = "execute"
     CATEGORY = _CATEGORY
     DESCRIPTION = (
@@ -207,9 +224,35 @@ class MiniMaxH3Director:
         shift_audio=3.0,
         clear_vram_between_segments=True,
         export_source_images=False,
+        script_timeline="",
         **kwargs,
     ):
         del kwargs
+
+        # 外部剧本覆盖：script_timeline 由 H3ScriptLoader 提供时，优先用文件里的
+        # timeline / 全局提示词 / 总帧数，覆盖本节点对应的 widget。
+        if script_timeline and script_timeline.strip():
+            try:
+                _ext = json.loads(script_timeline)
+            except Exception as _e:
+                # 容错：外部剧本解析失败不要直接炸（否则数百秒渲染白跑）。
+                # 回退到导演台前端 widgets 里的剧本，并打印问题内容前 240 字符便于排查来源。
+                _preview = script_timeline[:240].replace("\n", " ⏎ ").replace("\r", "")
+                print(
+                    f"[MiniMax H3 Director] ⚠️ script_timeline 不是合法 JSON，已回退到节点内置剧本：{_e} | 内容预览: {_preview!r}"
+                )
+                _ext = None
+            if _ext is None:
+                # 解析失败：保持 timeline_data=节点内置剧本（不覆盖），跳过全局提示词/总帧数提取
+                pass
+            else:
+                timeline_data = script_timeline
+                _gp = (_ext.get("global") or {}).get("prompt")
+                if _gp:
+                    global_prompt = _gp
+                _tf = _ext.get("totalFrames")
+                if _tf:
+                    total_frames = int(_tf)
 
         plan = prepare_director_plan(
             timeline_data=timeline_data,
@@ -245,7 +288,7 @@ class MiniMaxH3Director:
             )
         )
 
-        return finalize_director_outputs(
+        result = finalize_director_outputs(
             plan,
             combined,
             segment_outputs,
@@ -257,3 +300,85 @@ class MiniMaxH3Director:
             pre_refine_segments=pre_segments,
             block_final_images=held_for_confirmation,
         )
+
+        # 追加输出：全局提示词原文 + 合并去重后的参考图（供二采/放大链直连）。
+        ref0, ref1, ref2 = _merged_unique_ref_images(plan)
+        all_ref = _all_ref_images(plan)
+        # 每段独立输出（与 all_ref_images 对称：始终暴露全量，不依赖 export_mode 分段开关）。
+        seg_videos = segment_outputs
+        seg_audios_out = [a for a in (segment_audios or []) if a is not None]
+        return (*result, plan.global_prompt, ref0, ref1, ref2, timeline_data, all_ref, seg_videos, seg_audios_out)
+
+
+def _merged_unique_ref_images(plan):
+    """合并 global_refs 与各段 refs，按文件名（退化用张量 id）去重，取前 3 张。
+
+    返回 (ref0, ref1, ref2)，不足的位置为 None（下游 ref_image_N 为 optional 输入）。
+    """
+    seen: dict = {}
+    # 全局参考优先，再按段顺序补
+    candidates = list(getattr(plan, "global_refs", None) or [])
+    for seg in getattr(plan, "segments", None) or []:
+        candidates.extend(seg.refs or [])
+    for ref in candidates:
+        key = (getattr(ref, "image_file", "") or "").strip()
+        if not key:
+            key = f"__tensor_{id(ref.tensor)}"
+        if key in seen:
+            continue
+        tensor = getattr(ref, "tensor", None)
+        if tensor is None:
+            continue
+        # IMAGE 张量 [N,H,W,C]；参考图取首帧即可
+        if tensor.ndim == 4 and int(tensor.shape[0]) > 1:
+            tensor = tensor[:1]
+        seen[key] = tensor.cpu().float()
+        if len(seen) >= 3:
+            break
+    values = list(seen.values())
+    return (values[0] if len(values) > 0 else None,
+            values[1] if len(values) > 1 else None,
+            values[2] if len(values) > 2 else None)
+
+
+def _all_ref_images(plan):
+    """合并 global_refs 与各段 refs，按文件名（退化用张量 id）去重，返回全部参考图 stack 成的 [N,H,W,C] 单张量。
+
+    与 _merged_unique_ref_images 不同：这里不截断前 3 张，返回模型支持的全部（≤ MAX_REFERENCE_IMAGES=9）。
+    无参考图时返回 None。下游节点（如放大二采 / 预览）可从这一个端口拿到所有参考图，无需逐个接线。
+    """
+    seen: dict = {}
+    candidates = list(getattr(plan, "global_refs", None) or [])
+    for seg in getattr(plan, "segments", None) or []:
+        candidates.extend(seg.refs or [])
+    tensors = []
+    for ref in candidates:
+        key = (getattr(ref, "image_file", "") or "").strip()
+        if not key:
+            key = f"__tensor_{id(ref.tensor)}"
+        if key in seen:
+            continue
+        tensor = getattr(ref, "tensor", None)
+        if tensor is None:
+            continue
+        # IMAGE 张量 [N,H,W,C]；参考图取首帧即可
+        if tensor.ndim == 4 and int(tensor.shape[0]) > 1:
+            tensor = tensor[:1]
+        seen[key] = True
+        tensors.append(tensor.cpu().float())
+    if not tensors:
+        return None
+    # 参考图可能来自不同段/不同原始尺寸（如 1086 vs 514），无法直接在 batch 维拼接。
+    # 统一对齐到首张的 H、W 后再 cat（下游仅作预览/放大二采链输入，resize 影响极小）。
+    target_h, target_w = int(tensors[0].shape[1]), int(tensors[0].shape[2])
+    aligned = []
+    for t in tensors:
+        if int(t.shape[1]) != target_h or int(t.shape[2]) != target_w:
+            # IMAGE 为 [1,H,W,C] -> 转 [1,C,H,W] 做插值 -> 转回 [1,H,W,C]
+            thw = t.permute(0, 3, 1, 2)
+            thw = torch.nn.functional.interpolate(
+                thw, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+            t = thw.permute(0, 2, 3, 1).contiguous()
+        aligned.append(t)
+    return torch.cat(aligned, dim=0)

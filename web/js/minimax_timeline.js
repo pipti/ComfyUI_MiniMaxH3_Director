@@ -11650,6 +11650,10 @@ function migrateDirectorOutputLinks(node) {
         const target = graph.getNodeById?.(link.target_id);
         const input = target?.inputs?.[link.target_slot];
         const inputType = (input?.type || "").toUpperCase();
+        // 源槽位类型若已与目标输入一致（如 global_prompt→prompt），说明是
+        // 合法新连线，不做旧布局迁移；仅当类型不匹配时才视为陈旧槽位。
+        const originType = (outputs[link.origin_slot]?.type || "").toUpperCase();
+        if (originType === inputType) continue;
 
         // Old layouts had report at slot 1 or 3 as STRING.
         if (inputType === "STRING" && byName.report != null && link.origin_slot !== byName.report) {

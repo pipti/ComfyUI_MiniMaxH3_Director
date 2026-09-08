@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 
 import folder_paths
@@ -570,6 +571,74 @@ def _register_route(routes, method: str, path: str, handler) -> None:
         raise AttributeError("Unsupported ComfyUI route table API")
 
 
+async def minimax_save_script(request):
+    """接收导演台/Loader 的 timeline_data，写盘为提示词配置单 .h3dp（供导出节点按钮即时保存）。"""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return web.Response(status=400, text=f"Invalid JSON: {exc}")
+    timeline_data = body.get("timeline_data") or ""
+    out_path = str(body.get("out_path") or "").strip()
+    if not out_path:
+        return web.Response(status=400, text="Missing out_path.")
+    if not os.path.isabs(out_path):
+        return web.Response(status=400, text=f"out_path 须为绝对路径：{out_path}")
+    try:
+        tl = json.loads(timeline_data)
+    except Exception as exc:
+        return web.Response(status=400, text=f"timeline_data 不是合法 JSON：{exc}")
+    # 原样存 timeline 原文（与 H3ScriptExporter.export 一致、与 H3ScriptLoader 透传分支对称，零损失）
+    d = os.path.dirname(out_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(tl, f, ensure_ascii=False, indent=2)
+    n = len(tl.get("segments", []) or [])
+    total = sum((s.get("durationSec") or 0) for s in tl.get("segments", []) or [])
+    return web.json_response({"status": f"已导出 {n} 段 / {total:.1f}s → {out_path}"})
+
+
+async def minimax_select_script(request):
+    """弹 tkinter 文件选择框（独立子进程跑），让用户挑 .h3dp/.json 配置单。
+
+    调 pythonw.exe 跑同目录的 select_script_dialog.py，选中的绝对路径写到 stdout。
+    子进程最多 10 分钟（用户可能慢慢挑）；用户取消返回 path="" cancelled=True。
+    """
+    try:
+        body = await request.json() if request.can_read_body and request.content_type == "application/json" else {}
+    except Exception:
+        body = {}
+    initial = str((body or {}).get("initial") or "").strip()
+
+    dialog_py = os.path.join(os.path.dirname(__file__), "select_script_dialog.py")
+    py = sys.executable
+    pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+    runner = pyw if os.path.isfile(pyw) else py
+
+    cmd = [runner, dialog_py]
+    if initial:
+        cmd.append(initial)
+
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        path = (result.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return web.json_response({"path": "", "error": "选择超时（>10 分钟）"}, status=408)
+    except Exception as exc:
+        log.warning("MiniMax H3 Director select_script failed: %s", exc)
+        return web.json_response({"path": "", "error": str(exc)}, status=500)
+
+    if not path:
+        return web.json_response({"path": "", "cancelled": True})
+    return web.json_response({"path": path})
+
+
 def register_routes() -> bool:
     """Register MiniMax H3 Director HTTP routes on the ComfyUI PromptServer."""
     global _ROUTES_REGISTERED
@@ -605,6 +674,8 @@ def register_routes() -> bool:
         "/minimax/director/first_pass_cache_status",
         minimax_first_pass_cache_status,
     )
+    _register_route(routes, "POST", "/minimax/director/save_script", minimax_save_script)
+    _register_route(routes, "POST", "/minimax/director/select_script", minimax_select_script)
     _ROUTES_REGISTERED = True
     log.info("MiniMax H3 Director HTTP routes registered")
     return True
