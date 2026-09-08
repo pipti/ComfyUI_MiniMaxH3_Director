@@ -549,6 +549,7 @@ async def minimax_first_pass_cache_status(request):
         plan.sample_steps = int(body.get("steps") or 25)
         plan.sample_sampler = str(body.get("sampler") or "")
         plan.sample_scheduler = str(body.get("scheduler") or "")
+        plan.sample_sigmas_linked = bool(body.get("sigmas_linked"))
         plan.sample_shift_video = float(body.get("shift_video") or 12.0)
         plan.sample_shift_audio = float(body.get("shift_audio") or 3.0)
         return web.json_response(inspect_first_pass_cache(node_id, plan))
@@ -558,19 +559,6 @@ async def minimax_first_pass_cache_status(request):
             {"exists": False, "matches": False, "error": str(exc)},
             status=400,
         )
-
-
-def _register_route(routes, method: str, path: str, handler) -> None:
-    if hasattr(routes, "add_route"):
-        routes.add_route(method, path, handler)
-    elif method == "POST" and hasattr(routes, "post"):
-        routes.post(path)(handler)
-    elif method == "GET" and hasattr(routes, "get"):
-        routes.get(path)(handler)
-    else:
-        raise AttributeError("Unsupported ComfyUI route table API")
-
-
 async def minimax_save_script(request):
     """接收导演台/Loader 的 timeline_data，写盘为提示词配置单 .h3dp（供导出节点按钮即时保存）。"""
     try:
@@ -639,6 +627,42 @@ async def minimax_select_script(request):
     return web.json_response({"path": path})
 
 
+async def minimax_clear_segment_cache(request):
+    """Delete first-pass (.pre.*) or final segment cache files. (merged from upstream 7de4a95)"""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return web.Response(status=400, text=f"Invalid JSON: {exc}")
+
+    node_id = str(body.get("node_id") or "").strip()
+    if not re.fullmatch(r"\d+", node_id):
+        return web.Response(status=400, text="Invalid Director node id.")
+
+    kind = str(body.get("kind") or "final").strip().lower()
+    if kind not in {"first_pass", "final", "all"}:
+        return web.Response(status=400, text="kind must be first_pass, final or all.")
+
+    try:
+        from .segment_cache import clear_segment_cache
+
+        removed = clear_segment_cache(node_id, kind=kind)
+        return web.json_response({"removed": removed, "kind": kind})
+    except Exception as exc:
+        log.warning("MiniMax H3 Director clear segment cache failed: %s", exc)
+        return web.Response(status=500, text=str(exc))
+
+
+def _register_route(routes, method: str, path: str, handler) -> None:
+    if hasattr(routes, "add_route"):
+        routes.add_route(method, path, handler)
+    elif method == "POST" and hasattr(routes, "post"):
+        routes.post(path)(handler)
+    elif method == "GET" and hasattr(routes, "get"):
+        routes.get(path)(handler)
+    else:
+        raise AttributeError("Unsupported ComfyUI route table API")
+
+
 def register_routes() -> bool:
     """Register MiniMax H3 Director HTTP routes on the ComfyUI PromptServer."""
     global _ROUTES_REGISTERED
@@ -651,6 +675,7 @@ def register_routes() -> bool:
         return False
 
     routes = server.routes
+
     _register_route(routes, "POST", "/minimax/director/upload_chunk", minimax_upload_video_chunk)
     _register_route(
         routes,
@@ -674,8 +699,15 @@ def register_routes() -> bool:
         "/minimax/director/first_pass_cache_status",
         minimax_first_pass_cache_status,
     )
+    _register_route(routes, "POST", "/minimax/director/clear_segment_cache", minimax_clear_segment_cache)
     _register_route(routes, "POST", "/minimax/director/save_script", minimax_save_script)
     _register_route(routes, "POST", "/minimax/director/select_script", minimax_select_script)
+    from .pack import minimax_download_pack, minimax_export_pack, minimax_import_pack
+
+    _register_route(routes, "POST", "/minimax/director/export_pack", minimax_export_pack)
+    _register_route(routes, "GET", "/minimax/director/download_pack", minimax_download_pack)
+    _register_route(routes, "POST", "/minimax/director/import_pack", minimax_import_pack)
     _ROUTES_REGISTERED = True
     log.info("MiniMax H3 Director HTTP routes registered")
+
     return True

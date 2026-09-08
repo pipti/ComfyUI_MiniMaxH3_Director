@@ -125,8 +125,9 @@ class SegmentRefAudio:
     """Standalone reference audio for MiniMax ``<Audio N>`` (index 0-based)."""
 
     index: int
-    audio: dict  # ComfyUI AUDIO: {waveform, sample_rate}
+    audio: dict | None = None  # ComfyUI AUDIO; lazy for uploaded files
     audio_file: str = ""
+    audio_path: str = ""  # absolute input path; runtime-only, not a cache identity
 
 
 @dataclass
@@ -221,7 +222,12 @@ class DirectorPlan:
     run_indices: frozenset[int] | None = None  # None = run all segments
     continuity_enabled: bool = False
     continuity_overlap_frames: int = 0
+    # "guide" (motion-context keyframes) | "continue" (引导+重绘 / latent remask).
+    continuity_mode: str = "guide"
+    continuity_redraw: float = 0.65
     global_ref_audios: list[SegmentRefAudio] = field(default_factory=list)
+    # Full source-video PCM reused only during this Director execution.
+    audio_decode_cache: dict = field(default_factory=dict, repr=False)
     refine: dict | None = None
     # Sampling knobs stamped at execute time (first-pass cache fingerprint).
     sample_seed: int = 0
@@ -229,8 +235,12 @@ class DirectorPlan:
     sample_steps: int = 25
     sample_sampler: str = ""
     sample_scheduler: str = ""
+    sample_sigmas: tuple[float, ...] | None = None
+    sample_sigmas_linked: bool = False
     sample_shift_video: float = 12.0
     sample_shift_audio: float = 3.0
+    # Set during execute when export_mode=segments (minimax_seg_export folder).
+    segment_mp4_run_dir: str | None = None
 
     @property
     def segment_count(self) -> int:
@@ -337,8 +347,8 @@ def _load_refs(ref_list: list[dict]) -> list[SegmentRef]:
     return sorted(refs, key=lambda r: r.index)
 
 
-def load_reference_audio_item(item: dict) -> dict | None:
-    """Load one timeline refAudios entry into a ComfyUI AUDIO dict."""
+def _reference_audio_file(item: dict) -> tuple[str, str]:
+    """Return (timeline-relative identity, absolute input path)."""
     rel = str(
         item.get("audioFile")
         or item.get("audio_file")
@@ -347,11 +357,19 @@ def load_reference_audio_item(item: dict) -> dict | None:
         or ""
     ).replace("\\", "/").strip()
     if not rel:
-        return None
+        return "", ""
     sub = str(item.get("subfolder") or "").replace("\\", "/").strip().strip("/")
     if sub and not rel.startswith(sub + "/"):
         rel = f"{sub}/{rel}"
     file_path = os.path.join(folder_paths.get_input_directory(), rel.replace("/", os.sep))
+    return rel, file_path
+
+
+def load_reference_audio_item(item: dict) -> dict | None:
+    """Load one timeline refAudios entry into a ComfyUI AUDIO dict."""
+    _rel, file_path = _reference_audio_file(item)
+    if not file_path:
+        return None
     if not os.path.isfile(file_path):
         log.warning("Reference audio missing: %s", file_path)
         return None
@@ -362,6 +380,7 @@ def load_reference_audio_item(item: dict) -> dict | None:
 
 
 def _load_ref_audios(audio_list: list[dict]) -> list[SegmentRefAudio]:
+    """Build lazy file-backed reference slots without decoding PCM up front."""
     out: list[SegmentRefAudio] = []
     for item in audio_list or []:
         if not isinstance(item, dict):
@@ -369,11 +388,20 @@ def _load_ref_audios(audio_list: list[dict]) -> list[SegmentRefAudio]:
         index = int(item.get("index", item.get("slot", len(out))))
         if index < 0 or index >= MAX_REFERENCE_AUDIOS:
             continue
-        audio = load_reference_audio_item(item)
-        if audio is None:
+        rel, file_path = _reference_audio_file(item)
+        if not file_path:
             continue
-        rel = str(item.get("audioFile") or item.get("audio_file") or item.get("fileName") or "").strip()
-        out.append(SegmentRefAudio(index=index, audio=audio, audio_file=rel))
+        if not os.path.isfile(file_path):
+            log.warning("Reference audio missing: %s", file_path)
+            continue
+        out.append(
+            SegmentRefAudio(
+                index=index,
+                audio=None,
+                audio_file=rel,
+                audio_path=file_path,
+            )
+        )
     return sorted(out, key=lambda a: a.index)
 
 
@@ -384,8 +412,36 @@ def segment_ref_audios_for_context(task_key: str, audios: list[SegmentRefAudio])
     return audios
 
 
-def ref_audios_to_dict(audios: list[SegmentRefAudio]) -> dict | None:
-    return ref_audios_dict([(a.index, a.audio) for a in audios])
+def ensure_ref_audio_pcm(
+    item: SegmentRefAudio,
+    *,
+    cache: dict | None = None,
+) -> dict | None:
+    """Decode file-backed reference audio on first use; keep graph-wired PCM."""
+    audio = item.audio
+    if isinstance(audio, dict) and audio.get("waveform") is not None:
+        return audio
+    path = str(item.audio_path or "").strip()
+    if not path:
+        return None
+    audio = load_reference_audio(path, cache=cache)
+    item.audio = audio
+    if audio is None:
+        log.warning("Failed to decode reference audio: %s", path)
+    return audio
+
+
+def ref_audios_to_dict(
+    audios: list[SegmentRefAudio],
+    *,
+    cache: dict | None = None,
+) -> dict | None:
+    items: list[tuple[int, dict]] = []
+    for item in audios:
+        audio = ensure_ref_audio_pcm(item, cache=cache)
+        if isinstance(audio, dict) and audio.get("waveform") is not None:
+            items.append((item.index, audio))
+    return ref_audios_dict(items)
 
 
 def _ref_video_entry_has_file(item: dict | None) -> bool:
@@ -757,6 +813,8 @@ def build_director_plan(
         )
 
     from .segment_continuity import (
+        resolve_continuity_mode,
+        resolve_continuity_redraw,
         resolve_continuity_settings,
         resolve_segment_continuity_from_prev,
     )
@@ -764,6 +822,8 @@ def build_director_plan(
     continuity_enabled, continuity_overlap = resolve_continuity_settings(
         timeline, segment_count=len(segments)
     )
+    continuity_mode = resolve_continuity_mode(timeline)
+    continuity_redraw = resolve_continuity_redraw(timeline)
     for seg, (_start, _end, seg_data) in zip(segments, segment_ranges):
         seg.continuity_from_prev = resolve_segment_continuity_from_prev(
             seg_data if isinstance(seg_data, dict) else {},
@@ -797,6 +857,8 @@ def build_director_plan(
         run_indices=_parse_run_selection(timeline, len(segments)),
         continuity_enabled=continuity_enabled,
         continuity_overlap_frames=continuity_overlap,
+        continuity_mode=continuity_mode,
+        continuity_redraw=continuity_redraw,
         global_ref_audios=global_ref_audios,
     )
 
@@ -921,7 +983,8 @@ def plan_summary(plan: DirectorPlan) -> str:
                 if seg.index > 0 and not getattr(seg, "continuity_from_prev", True)
             ]
             lines.append(
-                f"Segment continuity: ON (motion context {plan.continuity_overlap_frames}f)"
+                f"Segment continuity: ON ({getattr(plan, 'continuity_mode', 'guide')} "
+                f"motion context {plan.continuity_overlap_frames}f)"
             )
             if pinned:
                 lines.append("  Pin from prev: #" + ", #".join(str(i) for i in pinned))
@@ -973,7 +1036,8 @@ def plan_summary(plan: DirectorPlan) -> str:
             if seg.index > 0 and not getattr(seg, "continuity_from_prev", True)
         ]
         lines.append(
-            f"Segment continuity: ON (motion context {plan.continuity_overlap_frames}f "
+            f"Segment continuity: ON ({getattr(plan, 'continuity_mode', 'guide')} "
+            f"motion context {plan.continuity_overlap_frames}f "
             "→ pin previous tail + trim prefix; t2v/i2v/fl2v/r2v/v2v/rv2v)"
         )
         if pinned:
